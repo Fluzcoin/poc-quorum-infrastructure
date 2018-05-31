@@ -1,0 +1,156 @@
+#!/bin/bash
+exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+
+echo BEGIN_USERDATA
+
+###
+### INSTALL QUORUM BLOCKCHAIN AND ITS REQUIREMENTS
+###
+
+echo "\\n INSTALLING QUORUM \\n"
+
+sudo apt-get update
+
+# install build deps
+add-apt-repository ppa:ethereum/ethereum
+apt-get update
+apt-get install -y build-essential unzip libdb-dev libleveldb-dev libsodium-dev zlib1g-dev libtinfo-dev solc sysvbanner wrk
+
+# install constellation
+CVER="0.3.2"
+CREL="constellation-$CVER-ubuntu1604"
+wget -q https://github.com/jpmorganchase/constellation/releases/download/v$CVER/$CREL.tar.xz
+tar xfJ $CREL.tar.xz
+cp $CREL/constellation-node /usr/local/bin && chmod 0755 /usr/local/bin/constellation-node
+rm -rf $CREL
+
+# install golang
+GOREL=go1.9.3.linux-amd64.tar.gz
+wget -q https://dl.google.com/go/$GOREL
+tar xfz $GOREL
+mv go /usr/local/go
+rm -f $GOREL
+PATH=$PATH:/usr/local/go/bin
+echo 'PATH=$PATH:/usr/local/go/bin' >> /home/ubuntu/.bashrc
+
+# make/install quorum
+cd /home/ubuntu
+git clone https://github.com/jpmorganchase/quorum.git
+pushd quorum >/dev/null
+git checkout tags/v2.0.1
+make all
+cp build/bin/geth /usr/local/bin
+cp build/bin/bootnode /usr/local/bin
+popd >/dev/null
+
+# install Porosity
+wget -q https://github.com/jpmorganchase/quorum/releases/download/v1.2.0/porosity
+mv porosity /usr/local/bin && chmod 0755 /usr/local/bin/porosity
+
+# Install awscli
+sudo apt-get install awscli -y
+
+echo "\\n QUORUM INSTALLED \\n"
+
+
+###
+### SET UP QUORUM NODE
+###
+
+echo "\\n SETTING UP QUORUM NODE \\n"
+
+### INITIALIZE - create all necessary directories for the node
+cd /home/ubuntu
+
+mkdir quorum_node
+mkdir -p quorum_node/qdata/node/{keystore,geth,logs}
+mkdir -p quorum_node/qdata/logs
+mkdir -p quorum_node/qdata/c
+
+echo "\\n GETTING ENODE, UPLOADING TO S3 \\n"
+
+### Get the enode URL for this node
+/usr/local/bin/bootnode -genkey /home/ubuntu/quorum_node/qdata/node/geth/nodekey
+ENODE=`/usr/local/bin/bootnode -nodekey /home/ubuntu/quorum_node/qdata/node/geth/nodekey -writeaddress`
+PUBLIC_IP=`wget -qO- ipecho.net/plain`
+ENODE_URL="enode://$ENODE@$PUBLIC_IP:21000?discport=0&raftport=50401"
+echo $ENODE_URL >> enode_$PUBLIC_IP
+AWS_ACCESS_KEY_ID={access_key_id} AWS_SECRET_ACCESS_KEY={secret_access_key} aws s3 cp enode_$PUBLIC_IP s3://{bucket_url}/
+
+
+echo "[" > static-nodes.json
+echo '  "'"$ENODE_URL"'"' >> static-nodes.json
+echo "]" >> static-nodes.json
+
+echo "\\n GENERATED static-nodes.json \\n"
+cat static-nodes.json
+
+cp static-nodes.json /home/ubuntu/quorum_node/qdata/node/permissioned-nodes.json
+mv static-nodes.json /home/ubuntu/quorum_node/qdata/node
+
+echo "\\n ADDING STATIC NODES DOWNLOAD CRONJOB \\n"
+CRON_CMD="(cd /home/ubuntu && wget https://{bucket_url}/static-nodes.json > /home/ubuntu/wget.log && rm -f /home/ubuntu/quorum_node/qdata/nodestatic-nodes.json && rm /home/ubuntu/quorum_node/qdata/node/permissioned-nodes.json && cp static-nodes.json /home/ubuntu/quorum_node/qdata/node/permissioned-nodes.json &&  mv static-nodes.json /home/ubuntu/quorum_node/qdata/node)"
+CRONJOB="*/1 * * * * $CRON_CMD"
+( crontab -l | grep -v -F "$CRON_CMD" ; echo "$CRONJOB" ) | crontab -
+
+
+cd /home/ubuntu/quorum_node
+wget https://{bucket_url}/genesis.json
+
+
+echo "\\n DOWNLOADED GENESIS FILE \\n"
+cat genesis.json
+
+
+### Generate node keys
+cd /home/ubuntu/quorum_node/qdata/node/keystore
+echo | /usr/local/bin/constellation-node --generatekeys=key
+chmod 600 key.key
+chmod 600 key.pub
+
+echo "\\n GENERATED NODE KEYS \\n"
+echo "\\n NODE PUBLIC KEY: "
+cat key.pub
+
+
+### Initialize geth
+cd /home/ubuntu/quorum_node
+geth --datadir qdata/node init genesis.json
+echo "\\n INITIALIZED GETH \\n"
+
+
+### Setup and start constellation node
+
+DDIR="/home/ubuntu/quorum_node/qdata/c"
+
+cp "qdata/node/keystore/key.pub" "$DDIR/tm.pub"
+cp "qdata/node/keystore/key.key" "$DDIR/tm.key"
+chmod 600 $DDIR/tm.pub
+chmod 600 $DDIR/tm.key
+rm -f "$DDIR/tm.ipc"
+
+#chown -R ubuntu:ubuntu /home/ubuntu/quorum_node
+
+#sudo su - ubuntu
+cd /home/ubuntu/quorum_node/
+CMD="constellation-node --url=https://127.0.0.1:9001/ --port=9001 --workdir=$DDIR --socket=tm.ipc --publickeys=tm.pub --privatekeys=tm.key --othernodes=https://127.0.0.1:9001/ --verbosity=vvvvvvvv"
+echo "$CMD >> qdata/logs/constellation.log 2>&1 &"
+$CMD & > "qdata/logs/constellation.log" &disown
+
+
+# Allow constellation node to start
+sleep 10
+
+### STARTUP - ETHEREUM NODE
+
+echo "\\n STARTING ETH NODE \\n"
+ARGS="--raft --rpc --rpcaddr 0.0.0.0 --rpcapi admin,db,eth,debug,miner,net,shh,txpool,personal,web3,quorum --emitcheckpoints"
+nohup geth --datadir qdata/node $ARGS --permissioned --raftport 50401 --rpcport 22000 --port 21000 2>>qdata/logs/node.log
+echo "\\n STARTED ETH NODE \\n"
+
+### Copy a dummy private key to import an account
+cd /home/ubuntu
+echo "8a4bd9c761b7d460579bb50d8173ad0d6fc24fd717ba0760a114b736c9a9fb1d" > account.pkey
+yes "" | geth --datadir /home/ubuntu/quorum_node/qdata/node account import account.pkey
+
+echo END_USERDATA

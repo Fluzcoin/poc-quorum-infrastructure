@@ -1,0 +1,7 @@
+.terraform
+.idea
+*.iml
+*.tfstate.*
+*.pem
+plan
+.DS_Store

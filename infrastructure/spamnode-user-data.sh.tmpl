@@ -1,0 +1,40 @@
+#!/bin/bash
+exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+
+echo BEGIN_USERDATA
+
+###
+### INSTALL NODE/NPM, START TRANSACTION SPAMMING
+###
+
+echo ${node}
+
+echo "\\n NODE \\n"
+
+sudo apt-get update
+
+# Install awscli
+sudo apt-get install awscli -y
+
+curl -sL https://deb.nodesource.com/setup_8.x | sudo -E bash -
+sudo apt-get install nodejs -y
+sudo apt-get install npm -y
+sudo apt-get install unzip -y
+sudo apt-get install node-gyp -y
+
+cd /home/ubuntu
+git clone https://viesty@bitbucket.org/viesty/quorum-tx-testing.git
+cd quorum-tx-testing
+
+sudo npm i --unsafe-perm
+
+
+# Download account list files
+wget https://s3-eu-west-1.amazonaws.com/fluzfluz-quorum-testing/acclist.zip
+unzip acclist.zip
+
+echo "node spam_transactions --provider=http://${node}:22000" --txamount=250 > command
+
+node spam_transactions --provider=http://${node}:22000 --txamount=250
+
+echo END_USERDATA
